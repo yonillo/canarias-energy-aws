@@ -1,8 +1,18 @@
 import json
 import logging
+import os
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
-import requests
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None
+    ClientError = Exception
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -18,7 +28,7 @@ ISLANDS_CONFIG = {
         "ree_geo_id": 8749,
         "installed_wind_mw": 305.0,
         "installed_solar_mw": 115.0,
-        "peak_demand_ref_mw": 530.0
+        "peak_demand_ref_mw": 530.0,
     },
     "tenerife": {
         "name": "Tenerife",
@@ -27,7 +37,7 @@ ISLANDS_CONFIG = {
         "ree_geo_id": 8748,
         "installed_wind_mw": 245.0,
         "installed_solar_mw": 150.0,
-        "peak_demand_ref_mw": 560.0
+        "peak_demand_ref_mw": 560.0,
     },
     "lanzarote_fuerteventura": {
         "name": "Lanzarote - Fuerteventura",
@@ -36,7 +46,7 @@ ISLANDS_CONFIG = {
         "ree_geo_id": 8747,
         "installed_wind_mw": 85.0,
         "installed_solar_mw": 55.0,
-        "peak_demand_ref_mw": 240.0
+        "peak_demand_ref_mw": 240.0,
     },
     "la_palma": {
         "name": "La Palma",
@@ -45,7 +55,7 @@ ISLANDS_CONFIG = {
         "ree_geo_id": 8751,
         "installed_wind_mw": 12.0,
         "installed_solar_mw": 8.0,
-        "peak_demand_ref_mw": 45.0
+        "peak_demand_ref_mw": 45.0,
     },
     "la_gomera": {
         "name": "La Gomera",
@@ -54,7 +64,7 @@ ISLANDS_CONFIG = {
         "ree_geo_id": 8750,
         "installed_wind_mw": 12.0,
         "installed_solar_mw": 3.0,
-        "peak_demand_ref_mw": 15.0
+        "peak_demand_ref_mw": 15.0,
     },
     "el_hierro": {
         "name": "El Hierro (Gorona del Viento)",
@@ -63,12 +73,38 @@ ISLANDS_CONFIG = {
         "ree_geo_id": 8752,
         "installed_wind_mw": 11.5,
         "installed_solar_mw": 1.0,
-        "peak_demand_ref_mw": 8.5
-    }
+        "peak_demand_ref_mw": 8.5,
+    },
 }
 
 # Cache en memoria de la ejecución Lambda para no golpear 6 veces el endpoint general de REE
 _REE_ARCHIPELAGO_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _http_get_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 10,
+) -> Dict[str, Any]:
+    """
+    Cliente HTTP nativo sobre urllib.request.
+    Evita dependencias externas en el empaquetado Lambda y mantiene el zip ultra-ligero.
+    """
+    target_url = url
+    if params:
+        query_string = urllib.parse.urlencode(params)
+        target_url = f"{url}?{query_string}"
+
+    req_headers = {"User-Agent": "CanariasEnergyMonitor/1.0", "Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+
+    req = urllib.request.Request(target_url, headers=req_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        charset = response.info().get_content_charset() or "utf-8"
+        raw_body = response.read().decode(charset)
+        return json.loads(raw_body)
 
 
 def fetch_calima_and_air_quality(lat: float, lon: float) -> Dict[str, Any]:
@@ -77,13 +113,12 @@ def fetch_calima_and_air_quality(lat: float, lon: float) -> Dict[str, Any]:
         "latitude": lat,
         "longitude": lon,
         "current": "pm10,pm2_5,dust,aerosol_optical_depth,european_aqi",
-        "timezone": "Atlantic/Canary"
+        "timezone": "Atlantic/Canary",
     }
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        current = response.json().get("current", {})
-        
+        data = _http_get_json(url, params=params, timeout=10)
+        current = data.get("current", {})
+
         pm10 = current.get("pm10", 0.0) or 0.0
         if pm10 < 45:
             calima_level = "LIMPIO"
@@ -100,7 +135,7 @@ def fetch_calima_and_air_quality(lat: float, lon: float) -> Dict[str, Any]:
             "saharan_dust_ug_m3": current.get("dust"),
             "aerosol_optical_depth": current.get("aerosol_optical_depth"),
             "european_aqi": current.get("european_aqi"),
-            "calima_status": calima_level
+            "calima_status": calima_level,
         }
     except Exception as e:
         logger.error(f"Error extrayendo datos de calima ({lat}, {lon}): {e}")
@@ -118,12 +153,10 @@ def fetch_solar_and_wind(lat: float, lon: float) -> Dict[str, Any]:
         ),
         "hourly": "wind_speed_80m",
         "forecast_days": 1,
-        "timezone": "Atlantic/Canary"
+        "timezone": "Atlantic/Canary",
     }
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        data = _http_get_json(url, params=params, timeout=10)
         current = data.get("current", {})
         hourly_wind_80m = data.get("hourly", {}).get("wind_speed_80m", [None])[0]
 
@@ -140,7 +173,7 @@ def fetch_solar_and_wind(lat: float, lon: float) -> Dict[str, Any]:
             "solar_ghi_w_m2": ghi,
             "solar_direct_w_m2": current.get("direct_radiation"),
             "solar_diffuse_w_m2": diffuse,
-            "solar_diffuse_ratio": diffuse_ratio
+            "solar_diffuse_ratio": diffuse_ratio,
         }
     except Exception as e:
         logger.error(f"Error extrayendo datos solares/viento ({lat}, {lon}): {e}")
@@ -167,18 +200,17 @@ def fetch_ree_canarias_official() -> Dict[str, Any]:
         "end_date": end_date.strftime("%Y-%m-%dT23:59"),
         "time_trunc": "day",
         "geo_limit": "ccaa",
-        "geo_ids": 8742
+        "geo_ids": 8742,
     }
     headers = {
         "Accept": "application/json",
-        "User-Agent": "CanariasEnergyMonitor/1.0"
+        "User-Agent": "CanariasEnergyMonitor/1.0",
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=12)
-        response.raise_for_status()
-        included = response.json().get("included", [])
-        
+        body = _http_get_json(url, params=params, headers=headers, timeout=12)
+        included = body.get("included", [])
+
         mix = {}
         for item in included:
             title = item.get("attributes", {}).get("title", "Otro")
@@ -188,7 +220,7 @@ def fetch_ree_canarias_official() -> Dict[str, Any]:
                 mix[title] = {
                     "mwh_day": round(last.get("value", 0.0), 2),
                     "share_pct": round(last.get("percentage", 0.0) * 100, 2),
-                    "consolidated_date": last.get("datetime", "")[:10]
+                    "consolidated_date": last.get("datetime", "")[:10],
                 }
         _REE_ARCHIPELAGO_CACHE = mix
         return mix
@@ -199,13 +231,11 @@ def fetch_ree_canarias_official() -> Dict[str, Any]:
 
 
 def estimate_island_realtime_telemetry(
-    config: Dict[str, Any],
-    weather: Dict[str, Any],
-    air_quality: Dict[str, Any]
+    config: Dict[str, Any], weather: Dict[str, Any], air_quality: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
     Calcula la estimación física en tiempo real (MW) por isla cruzando:
-    - Curva de potencia eólica a 80m de altura (cut-in: 11 km/h, nominal: 43 km/h)
+    - Curva de potencia eólica a 80m de altura (cut-in: 11 km/h, nominal: 43 km/h, cut-out: 90 km/h)
     - Irradiancia solar real atenuada por el polvo sahariano (PM10 / Dust)
     - Capacidad instalada oficial de cada isla en Red Eléctrica
     """
@@ -219,7 +249,7 @@ def estimate_island_realtime_telemetry(
     elif wind_80m >= 45.0:
         wind_cf = 0.85
     else:
-        # Curva cúbica suavizada típica de aerogeneradores en Canarias
+        # Curva de potencia aerodinámica suavizada típica de aerogeneradores en Canarias
         wind_cf = min(0.85, ((wind_80m - 11.0) / 34.0) ** 1.6)
 
     # 2. Factor de capacidad solar fotovoltaico penalizado por calima (ensuciamiento + dispersión)
@@ -228,7 +258,7 @@ def estimate_island_realtime_telemetry(
 
     est_wind_mw = round(config["installed_wind_mw"] * wind_cf, 2)
     est_solar_mw = round(config["installed_solar_mw"] * solar_cf, 2)
-    
+
     # Ajuste horario de demanda insular (valle nocturno vs punta diurna)
     hour_utc = datetime.now(timezone.utc).hour
     load_factor = 0.62 if (0 <= hour_utc <= 6) else (0.92 if (18 <= hour_utc <= 22) else 0.82)
@@ -236,7 +266,9 @@ def estimate_island_realtime_telemetry(
 
     total_renewable_mw = round(min(est_demand_mw, est_wind_mw + est_solar_mw), 2)
     fossil_backup_mw = round(max(0.0, est_demand_mw - total_renewable_mw), 2)
-    renewable_share_pct = round((total_renewable_mw / est_demand_mw) * 100, 2) if est_demand_mw > 0 else 0.0
+    renewable_share_pct = (
+        round((total_renewable_mw / est_demand_mw) * 100, 2) if est_demand_mw > 0 else 0.0
+    )
 
     return {
         "estimated_demand_mw": est_demand_mw,
@@ -245,18 +277,18 @@ def estimate_island_realtime_telemetry(
         "estimated_fossil_backup_mw": fossil_backup_mw,
         "instant_renewable_share_pct": renewable_share_pct,
         "wind_capacity_factor": round(wind_cf, 3),
-        "solar_calima_efficiency_factor": round(calima_penalty, 3)
+        "solar_calima_efficiency_factor": round(calima_penalty, 3),
     }
 
 
 def build_island_snapshot(island_key: str, config: Dict[str, Any]) -> Dict[str, Any]:
     now_utc = datetime.now(timezone.utc).isoformat()
-    
+
     air_quality = fetch_calima_and_air_quality(config["lat"], config["lon"])
     weather = fetch_solar_and_wind(config["lat"], config["lon"])
     ree_archipelago_mix = fetch_ree_canarias_official()
     realtime_telemetry = estimate_island_realtime_telemetry(config, weather, air_quality)
-    
+
     dust = air_quality.get("saharan_dust_ug_m3") or 0.0
     clouds = weather.get("cloud_cover_pct") or 0
     calima_solar_impact_index = round((dust * (100 - clouds) / 100.0), 2)
@@ -272,25 +304,95 @@ def build_island_snapshot(island_key: str, config: Dict[str, Any]) -> Dict[str, 
             "calima_solar_attenuation_index": calima_solar_impact_index
         },
         "island_realtime_estimation_mw": realtime_telemetry,
-        "ree_canarias_consolidated_mix": ree_archipelago_mix
+        "ree_canarias_consolidated_mix": ree_archipelago_mix,
     }
+
+
+def persist_to_dynamodb(table_name: str, snapshots: List[Dict[str, Any]]) -> int:
+    """
+    Escribe el snapshot actual de cada isla en Amazon DynamoDB (Hot Path).
+    Convierte automáticamente los floats de Python a Decimal para compatibilidad con DynamoDB.
+    """
+    if not boto3 or not table_name:
+        logger.info("DynamoDB: persistencia omitida (entorno local o tabla no configurada).")
+        return 0
+
+    try:
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(table_name)
+        written = 0
+
+        with table.batch_writer() as batch:
+            for item in snapshots:
+                # DynamoDB requiere Decimal en vez de float nativo de Python
+                item_decimal = json.loads(json.dumps(item), parse_float=Decimal)
+                batch.put_item(Item=item_decimal)
+                written += 1
+
+        logger.info(f"DynamoDB: {written} snapshots persistidos exitosamente en '{table_name}'.")
+        return written
+    except Exception as e:
+        logger.error(f"Error escribiendo en DynamoDB ({table_name}): {e}")
+        return 0
+
+
+def persist_to_s3_datalake(bucket_name: str, snapshots: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Escribe un archivo NDJSON en Amazon S3 bajo particionado Hive (Cold Path).
+    Estructura de partición: raw/year=YYYY/month=MM/day=DD/canarias_energy_YYYYMMDD_HHMMSS.ndjson
+    """
+    if not boto3 or not bucket_name:
+        logger.info("S3: persistencia omitida (entorno local o bucket no configurado).")
+        return None
+
+    try:
+        now = datetime.now(timezone.utc)
+        partition = f"raw/year={now.year:04d}/month={now.month:02d}/day={now.day:02d}"
+        filename = f"canarias_energy_{now.strftime('%Y%m%dT%H%M%SZ')}.ndjson"
+        s3_key = f"{partition}/{filename}"
+
+        # Un JSON completo por línea (estándar NDJSON para Glue/Athena)
+        ndjson_body = "\n".join(json.dumps(record, ensure_ascii=False) for record in snapshots) + "\n"
+
+        s3_client = boto3.client("s3")
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=ndjson_body.encode("utf-8"),
+            ContentType="application/x-ndjson",
+        )
+
+        logger.info(f"S3 Data Lake: guardado en s3://{bucket_name}/{s3_key}")
+        return s3_key
+    except Exception as e:
+        logger.error(f"Error escribiendo en S3 ({bucket_name}): {e}")
+        return None
 
 
 def lambda_handler(event: Optional[Dict] = None, context: Optional[Any] = None) -> Dict[str, Any]:
     logger.info("Iniciando ingesta energética y de calima en Canarias...")
     results = []
-    
+
     for island_key, config in ISLANDS_CONFIG.items():
         snapshot = build_island_snapshot(island_key, config)
         results.append(snapshot)
-        
+
+    s3_bucket = os.environ.get("S3_BUCKET_NAME")
+    dynamodb_table = os.environ.get("DYNAMODB_TABLE_NAME")
+
+    s3_key = persist_to_s3_datalake(s3_bucket, results) if s3_bucket else None
+    dynamo_count = persist_to_dynamodb(dynamodb_table, results) if dynamodb_table else 0
+
     return {
         "statusCode": 200,
         "ingested_islands": len(results),
-        "data": results
+        "persisted_dynamodb": dynamo_count,
+        "persisted_s3_key": s3_key,
+        "data": results,
     }
 
 
 if __name__ == "__main__":
     payload = lambda_handler()
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(f"Ingesta finalizada: {payload['ingested_islands']} islas procesadas.")
+    print(json.dumps(payload["data"][0], indent=2, ensure_ascii=False))
